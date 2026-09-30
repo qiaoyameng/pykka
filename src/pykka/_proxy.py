@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 from pykka import ActorDeadError, messages
+from pykka._future import Future
 from pykka._introspection import AttrInfo, introspect_attrs
 
 if TYPE_CHECKING:
-    from pykka import Actor, ActorRef, Future
+    from pykka import Actor, ActorRef
     from pykka._types import AttrPath
 
-__all__ = ["ActorProxy"]
+__all__ = ["ActorProxy", "BatchProxy"]
 
 
 logger = logging.getLogger("pykka")
@@ -171,6 +172,35 @@ class ActorProxy(Generic[A]):
         result += [attr_path[0] for attr_path in list(self._known_attrs.keys())]
         return sorted(result)
 
+    def batch(self) -> BatchProxy[A]:
+        """Create a batch proxy for recording operations on this actor.
+
+        The returned [`BatchProxy`][pykka.BatchProxy] records attribute
+        reads, attribute writes, and method calls without sending any
+        messages. When
+        [`BatchProxy.execute()`][pykka.BatchProxy.execute] is called, all
+        recorded operations are sent to the actor as a single inbox message
+        and executed in order, without any other messages being processed
+        in between.
+
+        Example:
+            ```py
+            proxy = AnActor.start().proxy()
+
+            batch = proxy.batch()
+            batch.count  # Records an attribute read
+            batch.increment(5)  # Records a method call
+            results = batch.execute().get()
+            ```
+
+        Returns:
+            a new [`BatchProxy`][pykka.BatchProxy] for this actor
+
+        /// note | Version added: Pykka 4.5
+        ///
+        """
+        return BatchProxy(proxy=self)
+
     def __getattr__(self, name: str) -> Any:
         """Get a field or callable from the actor."""
         attr_path: AttrPath = (*self._attr_path, name)
@@ -289,6 +319,220 @@ class CallableProxy(Generic[A]):
             attr_path=self._attr_path, args=args, kwargs=kwargs
         )
         self.actor_ref.tell(message)
+
+
+class BatchProxy(Generic[A]):
+    """Records proxy operations and executes them as a single batch.
+
+    A batch proxy is created with
+    [`ActorProxy.batch()`][pykka.ActorProxy.batch]. It records attribute
+    reads, attribute writes, and method calls without sending anything to
+    the actor. When [`execute()`][pykka.BatchProxy.execute] is called, all
+    recorded operations are sent to the actor as a *single* inbox message.
+    The actor then executes the operations in order, and no other messages
+    can be processed by the actor in between them. This makes batches
+    useful for reading a consistent snapshot of several attributes, or for
+    applying a group of changes atomically with respect to other messages.
+
+    Example:
+        ```py
+        proxy = Counter.start().proxy()
+
+        batch = proxy.batch()
+        batch.count  # Records an attribute read
+        batch.increment(5)  # Records a method call
+        batch.name = "counter"  # Records an attribute write
+
+        # Sends all three operations as one message:
+        count, incremented, _ = batch.execute().get()
+        ```
+
+    Attribute paths are validated against the same rules as regular proxy
+    attribute access: private attributes are not accessible, and nested
+    attributes are only accessible if marked with
+    [`traversable()`][pykka.traversable].
+
+    Recording an operation does not return a future; the results of all
+    operations are returned by [`execute()`][pykka.BatchProxy.execute] as
+    a single future of a list, with results ordered by the position the
+    operations were recorded in.
+
+    Note that a batch is *not* a transaction: if an operation fails, the
+    side effects of the operations already executed are not rolled back.
+
+    A batch must not block waiting for another future of the same actor,
+    as the actor is busy executing the batch and cannot complete the other
+    future, which would deadlock. To help avoid this,
+    [`Future`][pykka.Future] instances are rejected as call arguments when
+    recording a method call.
+
+    /// note | Version added: Pykka 4.5
+    ///
+    """
+
+    _proxy: ActorProxy[A]
+    _attr_path: AttrPath
+    _operations: list[messages.ProxyOperation]
+
+    def __init__(
+        self,
+        *,
+        proxy: ActorProxy[A],
+        attr_path: AttrPath | None = None,
+        operations: list[messages.ProxyOperation] | None = None,
+    ) -> None:
+        self._proxy = proxy
+        self._attr_path = attr_path or ()
+        self._operations = operations if operations is not None else []
+
+    def __repr__(self) -> str:
+        return (
+            f"<BatchProxy for {self._proxy.actor_ref}, "
+            f"attr_path={self._attr_path!r}, "
+            f"operations={len(self._operations)}>"
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Record a field read, or get a traversable or callable recorder."""
+        attr_path: AttrPath = (*self._attr_path, name)
+
+        known_attrs = self._proxy._known_attrs  # noqa: SLF001
+        if attr_path not in known_attrs:
+            known_attrs = introspect_attrs(
+                root=self._proxy._actor,  # noqa: SLF001
+                proxy=self._proxy,
+            )
+            self._proxy._known_attrs = known_attrs  # noqa: SLF001
+
+        attr_info = known_attrs.get(attr_path)
+        if attr_info is None:
+            msg = f"{self._proxy} has no attribute {name!r}"
+            raise AttributeError(msg)
+
+        if attr_info.callable:
+            return _BatchCallableProxy(batch=self, attr_path=attr_path)
+
+        if attr_info.traversable:
+            return BatchProxy(
+                proxy=self._proxy,
+                attr_path=attr_path,
+                operations=self._operations,
+            )
+
+        self._operations.append(messages.ProxyGetAttr(attr_path=attr_path))
+        return None
+
+    def __setattr__(
+        self,
+        name: str,
+        value: Any,
+    ) -> None:
+        """Record a field write on the actor."""
+        if name.startswith("_"):
+            return super().__setattr__(name, value)
+        attr_path = (*self._attr_path, name)
+        self._operations.append(
+            messages.ProxySetAttr(attr_path=attr_path, value=value)
+        )
+        return None
+
+    def execute(
+        self,
+        *,
+        on_error: Literal["stop", "collect"] = "stop",
+    ) -> Future[list[Any]]:
+        """Send the recorded operations to the actor as a single message.
+
+        The operations are executed by the actor in the order they were
+        recorded, and no other messages are processed by the actor in
+        between them.
+
+        The returned future yields a list with one result per recorded
+        operation, ordered by the position the operations were recorded
+        in. Attribute writes yield `None`.
+
+        If an operation raises an exception, the behavior depends on
+        `on_error`:
+
+        - `"stop"` (default): the batch is aborted and the returned future
+          raises the exception when [`get()`][pykka.Future.get] is called.
+          The remaining operations are not executed.
+        - `"collect"`: the exception object is placed at the failing
+          operation's position in the result list, and the remaining
+          operations are still executed.
+
+        In both modes, the side effects of operations already executed are
+        *not* rolled back; a batch is not a transaction.
+
+        The batch is consumed by this method: the recorded operations are
+        cleared, and the batch proxy can be reused to record a new batch.
+
+        Args:
+            on_error: `"stop"` to abort on the first error, or `"collect"`
+                to collect errors in the result list and continue.
+
+        Raises:
+            ValueError: if `on_error` is invalid or no operations have
+                been recorded.
+
+        Returns:
+            a future of the list of results, ordered by position
+
+        """
+        if on_error not in ("stop", "collect"):
+            msg = f"on_error must be 'stop' or 'collect', not {on_error!r}"
+            raise ValueError(msg)
+        if not self._operations:
+            msg = "Cannot execute a batch with no recorded operations"
+            raise ValueError(msg)
+        operations = tuple(self._operations)
+        self._operations.clear()
+        message = messages.ProxyBatch(operations=operations, on_error=on_error)
+        return self._proxy.actor_ref.ask(message, block=False)
+
+
+class _BatchCallableProxy(Generic[A]):
+    """Records a single method call in a batch."""
+
+    _batch: BatchProxy[A]
+    _attr_path: AttrPath
+
+    def __init__(
+        self,
+        *,
+        batch: BatchProxy[A],
+        attr_path: AttrPath,
+    ) -> None:
+        self._batch = batch
+        self._attr_path = attr_path
+
+    def __call__(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Record a method call in the batch.
+
+        Raises:
+            ValueError: if any argument is a [`Future`][pykka.Future], as
+                the actor cannot block waiting for another future while
+                executing the batch without risking a deadlock.
+
+        """
+        for arg in (*args, *kwargs.values()):
+            if isinstance(arg, Future):
+                msg = (
+                    "A Future cannot be used as an argument in a batch "
+                    "operation. The batch is executed as a single message "
+                    "by the actor, which cannot block waiting for another "
+                    "future of the same actor without deadlocking."
+                )
+                raise ValueError(msg)
+        self._batch._operations.append(  # noqa: SLF001
+            messages.ProxyCall(
+                attr_path=self._attr_path, args=args, kwargs=kwargs
+            )
+        )
 
 
 def traversable(obj: T) -> T:

@@ -26,7 +26,7 @@ special circumstances.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 if TYPE_CHECKING:
     from pykka._types import AttrPath
@@ -76,3 +76,33 @@ class ProxySetAttr(NamedTuple):
 
     value: Any
     """The value to set the attribute to."""
+
+
+#: Union of the proxy operation messages that can be part of a batch.
+ProxyOperation = ProxyCall | ProxyGetAttr | ProxySetAttr
+
+
+class ProxyBatch(NamedTuple):
+    """Message to ask the actor to execute a batch of proxy operations.
+
+    The operations are executed in order as a single inbox message, so no
+    other messages are processed by the actor in between the operations.
+
+    If an operation raises an exception, the behavior depends on `on_error`:
+
+    - `"stop"`: the batch is aborted and the exception is raised by the
+      future returned to the sender. Operations already executed are *not*
+      rolled back; their side effects remain applied.
+    - `"collect"`: the exception is collected and placed at the operation's
+      position in the result list, and the batch continues with the next
+      operation.
+
+    /// note | Version added: Pykka 4.5
+    ///
+    """
+
+    operations: tuple[ProxyOperation, ...]
+    """The proxy operations to execute, in order."""
+
+    on_error: Literal["stop", "collect"] = "stop"
+    """Whether to abort on the first error or collect errors and continue."""

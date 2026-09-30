@@ -260,7 +260,7 @@ class Actor(abc.ABC):
                 response = self._handle_receive(envelope.message)
                 if envelope.reply_to is not None:
                     envelope.reply_to.set(response)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 if envelope.reply_to is not None:
                     logger.info(
                         f"Exception returned from {self} to caller:",
@@ -372,6 +372,20 @@ class Actor(abc.ABC):
         """Handle messages sent to the actor."""
         if isinstance(message, messages._ActorStop):  # noqa: SLF001
             return self._stop()
+        if isinstance(message, messages.ProxyBatch):
+            return self._handle_proxy_batch(message)
+        if isinstance(
+            message,
+            messages.ProxyCall | messages.ProxyGetAttr | messages.ProxySetAttr,
+        ):
+            return self._handle_proxy_message(message)
+        return self.on_receive(message)
+
+    def _handle_proxy_message(
+        self,
+        message: messages.ProxyOperation,
+    ) -> Any:
+        """Handle a single proxy operation message."""
         if isinstance(message, messages.ProxyCall):
             callee = get_attr_directly(self, message.attr_path)
             return callee(*message.args, **message.kwargs)
@@ -382,7 +396,35 @@ class Actor(abc.ABC):
             parent_attr = get_attr_directly(self, message.attr_path[:-1])
             attr_name = message.attr_path[-1]
             return setattr(parent_attr, attr_name, message.value)
-        return self.on_receive(message)
+        msg = f"Unknown proxy operation: {message!r}"
+        raise TypeError(msg)
+
+    def _handle_proxy_batch(
+        self,
+        message: messages.ProxyBatch,
+    ) -> list[Any]:
+        """Handle a batch of proxy operations as a single inbox message.
+
+        The operations are executed in order without any other messages
+        being processed in between.
+
+        With ``on_error="stop"``, the first exception aborts the batch and
+        propagates to the caller. Side effects of operations already
+        executed are not rolled back.
+
+        With ``on_error="collect"``, exceptions are caught and placed at
+        the failing operation's position in the returned list, and the
+        remaining operations are still executed.
+        """
+        results: list[Any] = []
+        for operation in message.operations:
+            try:
+                results.append(self._handle_proxy_message(operation))
+            except Exception:
+                if message.on_error == "stop":
+                    raise
+                results.append(sys.exc_info()[1])
+        return results
 
     def on_receive(self, message: Any) -> Any:
         """May be implemented for the actor to handle regular non-proxy messages.
