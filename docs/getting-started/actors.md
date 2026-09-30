@@ -100,6 +100,38 @@ either using immutable data structures or to
 actors.
 ///
 
+### Propagating context variables
+
+Context variables don't automatically follow messages to another thread.
+An actor can declare the context variables it is allowed to receive by
+setting [`Actor.context_vars`][pykka.Actor.context_vars]:
+
+```py
+import contextvars
+
+
+trace_id_var = contextvars.ContextVar("trace_id")
+
+
+class TracedActor(pykka.ThreadingActor):
+    context_vars = (trace_id_var,)
+
+    def on_receive(self, message):
+        return trace_id_var.get(None)
+```
+
+[`tell()`][pykka.ActorRef.tell] and [`ask()`][pykka.ActorRef.ask] then copy
+the sender's current values for those variables. Pass `context_vars` to copy a
+subset of the actor's allowed variables. Variables that are not included in the
+receiving actor's allowlist are never copied, and the actor thread's original
+context is restored after each message, including when message handling raises.
+
+Messages sent while an actor handles a message continue to propagate the current
+message context. Callbacks and get hooks on a
+[`Future`][pykka.Future] run in the context captured when the hook was
+registered, not the context of the thread that eventually calls
+[`Future.get()`][pykka.Future.get].
+
 Summarized in code:
 
 ```py

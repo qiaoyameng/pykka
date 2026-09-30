@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import abc
+import contextvars
 import logging
 import sys
 import threading
 import uuid
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
 
 from pykka import ActorDeadError, ActorRef, ActorRegistry, messages
+from pykka._context import use_context_vars
 from pykka._introspection import get_attr_directly
 
 if TYPE_CHECKING:
@@ -171,6 +174,9 @@ class Actor(abc.ABC):
     inbox.
     """
 
+    context_vars: ClassVar[Iterable[contextvars.ContextVar[Any]]] = ()
+    """Context variables copied from the sender while messages are handled."""
+
     _actor_ref: ActorRef[Any]
 
     @property
@@ -256,45 +262,50 @@ class Actor(abc.ABC):
     def _actor_loop_running(self) -> None:
         while not self.actor_stopped.is_set():
             envelope = self.actor_inbox.get()
-            try:
-                response = self._handle_receive(envelope.message)
-                if envelope.reply_to is not None:
-                    envelope.reply_to.set(response)
-            except Exception:
-                if envelope.reply_to is not None:
-                    logger.info(
-                        f"Exception returned from {self} to caller:",
-                        exc_info=sys.exc_info(),
-                    )
-                    envelope.reply_to.set_exception()
-                else:
-                    self._handle_failure(*sys.exc_info())
-                    try:
-                        self.on_failure(*sys.exc_info())
-                    except Exception:  # noqa: BLE001
+            with use_context_vars(envelope.context):
+                try:
+                    response = self._handle_receive(envelope.message)
+                    if envelope.reply_to is not None:
+                        envelope.reply_to.set(response)
+                except Exception:
+                    if envelope.reply_to is not None:
+                        logger.info(
+                            f"Exception returned from {self} to caller:",
+                            exc_info=sys.exc_info(),
+                        )
+                        envelope.reply_to.set_exception()
+                    else:
                         self._handle_failure(*sys.exc_info())
-            except BaseException:  # noqa: BLE001
-                exception_value = sys.exc_info()[1]
-                logger.debug(f"{exception_value!r} in {self}. Stopping all actors.")
-                self._stop()
-                ActorRegistry.stop_all()
+                        try:
+                            self.on_failure(*sys.exc_info())
+                        except Exception:  # noqa: BLE001
+                            self._handle_failure(*sys.exc_info())
+                except BaseException:  # noqa: BLE001
+                    exception_value = sys.exc_info()[1]
+                    logger.debug(f"{exception_value!r} in {self}. Stopping all actors.")
+                    self._stop()
+                    ActorRegistry.stop_all()
 
     def _actor_loop_teardown(self) -> None:
         while not self.actor_inbox.empty():
             envelope = self.actor_inbox.get()
-            if envelope.reply_to is not None:
-                if isinstance(envelope.message, messages._ActorStop):  # noqa: SLF001
-                    envelope.reply_to.set(None)
-                else:
-                    envelope.reply_to.set_exception(
-                        exc_info=(
-                            ActorDeadError,
-                            ActorDeadError(
-                                f"{self.actor_ref} stopped before handling the message"
-                            ),
-                            None,
+            with use_context_vars(envelope.context):
+                if envelope.reply_to is not None:
+                    if isinstance(
+                        envelope.message, messages._ActorStop
+                    ):  # noqa: SLF001
+                        envelope.reply_to.set(None)
+                    else:
+                        envelope.reply_to.set_exception(
+                            exc_info=(
+                                ActorDeadError,
+                                ActorDeadError(
+                                    f"{self.actor_ref} stopped before "
+                                    "handling the message"
+                                ),
+                                None,
+                            )
                         )
-                    )
 
     def on_start(self) -> None:  # noqa: B027
         """Run code at the beginning of the actor's life.

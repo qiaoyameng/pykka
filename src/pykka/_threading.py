@@ -4,6 +4,7 @@ import queue
 import sys
 import threading
 import time
+from contextvars import Context
 from itertools import count
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
@@ -108,11 +109,13 @@ class ThreadingFuture(Future[T]):
     def set_get_hook(
         self,
         func: GetHookFunc[T],
+        *,
+        context: Context | None = None,
     ) -> None:
         with self._condition:
             if self._result is not None:
                 raise queue.Full
-            super().set_get_hook(func)
+            super().set_get_hook(func, context=context)
             self._condition.notify_all()
 
 

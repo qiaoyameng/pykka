@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from pykka._context import ContextVarSnapshot
+
 if TYPE_CHECKING:
     from pykka import Future
 
@@ -16,7 +18,7 @@ class Envelope(Generic[T]):
     """
 
     # Using slots speeds up envelope creation with ~20%
-    __slots__ = ["message", "reply_to"]
+    __slots__ = ["message", "reply_to", "context"]
 
     message: T
     """The message to send."""
@@ -24,9 +26,21 @@ class Envelope(Generic[T]):
     reply_to: Future[Any] | None
     """The future to reply to if there is a response."""
 
-    def __init__(self, message: T, reply_to: Future[Any] | None = None) -> None:
+    context: ContextVarSnapshot
+    """The context variable values to set while handling the message."""
+
+    def __init__(
+        self,
+        message: T,
+        reply_to: Future[Any] | None = None,
+        context: ContextVarSnapshot = (),
+    ) -> None:
         self.message = message
         self.reply_to = reply_to
+        self.context = context
 
     def __repr__(self) -> str:
-        return f"Envelope(message={self.message!r}, reply_to={self.reply_to!r})"
+        return (
+            f"Envelope(message={self.message!r}, reply_to={self.reply_to!r}, "
+            f"context={self.context!r})"
+        )

@@ -12,6 +12,7 @@ from typing import (
 )
 
 from pykka import ActorDeadError, ActorProxy
+from pykka._context import ContextVarSnapshot, ContextVars, copy_context_vars
 from pykka._envelope import Envelope
 from pykka.messages import _ActorStop
 
@@ -25,6 +26,17 @@ __all__ = ["ActorRef"]
 
 
 A = TypeVar("A", bound="Actor")
+
+
+def _copy_allowed_context_vars(
+    actor_class: type[Actor],
+    context_vars: ContextVars | None,
+) -> ContextVarSnapshot:
+    allowed = frozenset(actor_class.context_vars)
+    selected = actor_class.context_vars if context_vars is None else context_vars
+    return copy_context_vars(
+        variable for variable in selected if variable in allowed
+    )
 
 
 class ActorRef(Generic[A]):
@@ -80,6 +92,8 @@ class ActorRef(Generic[A]):
     def tell(
         self,
         message: Any,
+        *,
+        context_vars: ContextVars | None = None,
     ) -> None:
         """Send message to actor without waiting for any response.
 
@@ -88,6 +102,7 @@ class ActorRef(Generic[A]):
 
         Args:
             message: message to send
+            context_vars: context variables to copy to the receiving actor
 
         Raises:
             ActorDeadError: if actor is not available
@@ -96,7 +111,15 @@ class ActorRef(Generic[A]):
         if not self.is_alive():
             msg = f"{self} not found"
             raise ActorDeadError(msg)
-        self.actor_inbox.put(Envelope(message))
+        self.actor_inbox.put(
+            Envelope(
+                message,
+                context=_copy_allowed_context_vars(
+                    self.actor_class,
+                    context_vars,
+                ),
+            )
+        )
 
     @overload
     def ask(
@@ -104,6 +127,7 @@ class ActorRef(Generic[A]):
         message: Any,
         *,
         block: Literal[False],
+        context_vars: ContextVars | None = None,
         timeout: float | None = None,
     ) -> Future[Any]: ...
 
@@ -113,6 +137,7 @@ class ActorRef(Generic[A]):
         message: Any,
         *,
         block: Literal[True],
+        context_vars: ContextVars | None = None,
         timeout: float | None = None,
     ) -> Any: ...
 
@@ -122,6 +147,7 @@ class ActorRef(Generic[A]):
         message: Any,
         *,
         block: bool = True,
+        context_vars: ContextVars | None = None,
         timeout: float | None = None,
     ) -> Any | Future[Any]: ...
 
@@ -130,6 +156,7 @@ class ActorRef(Generic[A]):
         message: Any,
         *,
         block: bool = True,
+        context_vars: ContextVars | None = None,
         timeout: float | None = None,
     ) -> Any | Future[Any]:
         """Send message to actor and wait for the reply.
@@ -146,6 +173,7 @@ class ActorRef(Generic[A]):
         Args:
             message: message to send
             block: whether to block while waiting for a reply
+            context_vars: context variables to copy to the receiving actor
             timeout: seconds to wait before timeout if blocking
 
         Raises:
@@ -165,7 +193,16 @@ class ActorRef(Generic[A]):
         except ActorDeadError:
             future.set_exception()
         else:
-            self.actor_inbox.put(Envelope(message, reply_to=future))
+            self.actor_inbox.put(
+                Envelope(
+                    message,
+                    reply_to=future,
+                    context=_copy_allowed_context_vars(
+                        self.actor_class,
+                        context_vars,
+                    ),
+                )
+            )
 
         if block:
             return future.get(timeout=timeout)
