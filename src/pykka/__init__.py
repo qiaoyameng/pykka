@@ -2,8 +2,9 @@
 
 import logging as _logging
 
-from pykka._exceptions import ActorDeadError, Timeout
+from pykka._exceptions import ActorDeadError, MailboxFull, Timeout
 from pykka._future import Future, get_all
+from pykka._mailbox import Mailbox
 from pykka._proxy import ActorProxy, CallableProxy, traversable
 from pykka._ref import ActorRef
 from pykka._registry import ActorRegistry
@@ -21,6 +22,8 @@ __all__ = [
     "ActorRegistry",
     "CallableProxy",
     "Future",
+    "Mailbox",
+    "MailboxFull",
     "ThreadingActor",
     "ThreadingFuture",
     "Timeout",

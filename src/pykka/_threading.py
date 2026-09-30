@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 from pykka import Actor, Future, Timeout
 
 if TYPE_CHECKING:
-    from pykka._actor import ActorInbox
-    from pykka._envelope import Envelope
     from pykka._future import GetHookFunc
+    from pykka._mailbox import Mailbox
     from pykka._types import OptExcInfo
 
 __all__ = ["ThreadingActor", "ThreadingFuture"]
@@ -138,10 +137,30 @@ class ThreadingActor(Actor):
     always has to be set explicitly for the actor to run on a daemonic thread.
     """
 
-    @staticmethod
-    def _create_actor_inbox() -> ActorInbox:
-        inbox: queue.Queue[Envelope[Any]] = queue.Queue()
-        return inbox
+    max_queue_size: ClassVar[int | None] = None
+    """
+    The maximum number of messages that can be waiting in the actor's mailbox.
+
+    If `None` (the default), the mailbox is unbounded and will grow as long
+    as messages are produced faster than the actor can process them.
+
+    If set to a positive integer, the mailbox is bounded. When it is full:
+
+    - [`ActorRef.tell()`][pykka.ActorRef.tell] raises
+      [`pykka.MailboxFull`][pykka.MailboxFull] by default, or waits if given
+      a timeout.
+    - [`ActorRef.ask()`][pykka.ActorRef.ask] behaves the same, and the
+      exception is returned on the future when not blocking.
+
+    The stop signal uses a separate channel, so a full mailbox never
+    prevents an actor from being stopped.
+    """
+
+    @classmethod
+    def _create_actor_inbox(cls) -> Mailbox:
+        from pykka._mailbox import Mailbox
+
+        return Mailbox(maxsize=cls.max_queue_size)
 
     @staticmethod
     def _create_future() -> Future[Any]:

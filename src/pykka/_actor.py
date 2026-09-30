@@ -26,11 +26,22 @@ A = TypeVar("A", bound="Actor")
 
 
 class ActorInbox(Protocol):
-    def put(self, envelope: Envelope[Any], /) -> None: ...
+    def put(
+        self,
+        envelope: Envelope[Any],
+        /,
+        timeout: float | None = None,
+    ) -> None: ...
 
-    def get(self) -> Envelope[Any]: ...
+    def get(self, *, release_previous: bool = ...) -> Envelope[Any] | None: ...
 
     def empty(self) -> bool: ...
+
+    def request_stop(self, ack: Future[Any] | None = ...) -> None: ...
+
+    def finish_graceful_stop(self) -> None: ...
+
+    def terminate(self) -> None: ...
 
 
 class Actor(abc.ABC):
@@ -125,9 +136,9 @@ class Actor(abc.ABC):
         obj._start_actor_loop()
         return obj.actor_ref
 
-    @staticmethod
+    @classmethod
     @abc.abstractmethod
-    def _create_actor_inbox() -> ActorInbox:
+    def _create_actor_inbox(cls) -> ActorInbox:
         """Create an inbox for the actor.
 
         Internal method for implementors of new actor types.
@@ -212,7 +223,7 @@ class Actor(abc.ABC):
         in the [`ActorRegistry`][pykka.ActorRegistry].
         """
         self.actor_urn = uuid.uuid4().urn
-        self.actor_inbox = self._create_actor_inbox()
+        self.actor_inbox = type(self)._create_actor_inbox()
         self.actor_stopped = threading.Event()
 
         self._actor_ref = ActorRef(self)
@@ -226,23 +237,45 @@ class Actor(abc.ABC):
         It's equivalent to calling
         [`ActorRef.stop(block=False)`][pykka.ActorRef.stop].
         """
-        self.actor_ref.tell(messages._ActorStop())  # noqa: SLF001
+        self.actor_ref.stop(block=False)
 
-    def _stop(self) -> None:
-        """Stop the actor immediately without processing the rest of the inbox."""
+    def _terminate(self) -> None:
+        """Stop immediately without processing the rest of the inbox."""
+        self.actor_inbox.terminate()
         ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
         logger.debug(f"Stopped {self}")
+
+    def _finish_graceful_stop(self) -> None:
+        """Run the graceful shutdown hooks after the inbox was drained.
+
+        Called from the actor loop once a graceful stop was requested and all
+        messages already in the mailbox have been processed.
+        """
+        logger.debug(f"Stopped {self}")
+        ActorRegistry.unregister(self.actor_ref)
+        self.actor_stopped.set()
         try:
             self.on_stop()
         except Exception:  # noqa: BLE001
-            self._handle_failure(*sys.exc_info())
+            logger.error(
+                f"Unhandled exception in {self}:",
+                exc_info=sys.exc_info(),
+            )
+            try:
+                self.on_failure(*sys.exc_info())
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    f"Unhandled exception in {self}:",
+                    exc_info=sys.exc_info(),
+                )
 
     def _actor_loop(self) -> None:
         """Run the actor's core loop.
 
         This is the method that will be executed by the thread or greenlet.
         """
+        self.actor_inbox.consumer_ident = threading.get_ident()
         self._actor_loop_setup()
         self._actor_loop_running()
         self._actor_loop_teardown()
@@ -254,9 +287,19 @@ class Actor(abc.ABC):
             self._handle_failure(*sys.exc_info())
 
     def _actor_loop_running(self) -> None:
+        release_previous = False
         while not self.actor_stopped.is_set():
-            envelope = self.actor_inbox.get()
+            envelope = self.actor_inbox.get(release_previous=release_previous)
+            if envelope is None:
+                return
+            release_previous = True
             try:
+                if isinstance(envelope.message, messages._ActorStop):  # noqa: SLF001
+                    self.actor_inbox.request_stop(envelope.reply_to)
+                    # The ack (if any) is completed by the mailbox once the
+                    # inbox has fully drained. Keep processing messages that
+                    # were already enqueued before this marker.
+                    continue
                 response = self._handle_receive(envelope.message)
                 if envelope.reply_to is not None:
                     envelope.reply_to.set(response)
@@ -276,25 +319,39 @@ class Actor(abc.ABC):
             except BaseException:  # noqa: BLE001
                 exception_value = sys.exc_info()[1]
                 logger.debug(f"{exception_value!r} in {self}. Stopping all actors.")
-                self._stop()
+                logger.debug(f"Stopped {self}")
+                ActorRegistry.unregister(self.actor_ref)
+                self.actor_stopped.set()
+                try:
+                    self.on_stop()
+                except Exception:  # noqa: BLE001
+                    self._handle_failure(*sys.exc_info())
+                self.actor_inbox.terminate()
                 ActorRegistry.stop_all()
 
     def _actor_loop_teardown(self) -> None:
-        while not self.actor_inbox.empty():
-            envelope = self.actor_inbox.get()
+        while True:
+            envelope = self.actor_inbox.get(release_previous=False)
+            if envelope is None:
+                # All messages enqueued before the stop request have been
+                # processed (running phase) or error-replied (here). Close the
+                # mailbox last, so waiting producers and stop acknowledgers
+                # are only released once no message can be left without a
+                # receiver.
+                if not self.actor_stopped.is_set():
+                    self._finish_graceful_stop()
+                self.actor_inbox.finish_graceful_stop()
+                return
             if envelope.reply_to is not None:
-                if isinstance(envelope.message, messages._ActorStop):  # noqa: SLF001
-                    envelope.reply_to.set(None)
-                else:
-                    envelope.reply_to.set_exception(
-                        exc_info=(
-                            ActorDeadError,
-                            ActorDeadError(
-                                f"{self.actor_ref} stopped before handling the message"
-                            ),
-                            None,
-                        )
+                envelope.reply_to.set_exception(
+                    exc_info=(
+                        ActorDeadError,
+                        ActorDeadError(
+                            f"{self.actor_ref} stopped before handling the message"
+                        ),
+                        None,
                     )
+                )
 
     def on_start(self) -> None:  # noqa: B027
         """Run code at the beginning of the actor's life.
@@ -342,6 +399,7 @@ class Actor(abc.ABC):
             f"Unhandled exception in {self}:",
             exc_info=(exception_type, exception_value, traceback),  # type: ignore[arg-type]   # ty: ignore[invalid-argument-type]
         )
+        self.actor_inbox.terminate()
         ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
 
@@ -370,8 +428,6 @@ class Actor(abc.ABC):
 
     def _handle_receive(self, message: Any) -> Any:
         """Handle messages sent to the actor."""
-        if isinstance(message, messages._ActorStop):  # noqa: SLF001
-            return self._stop()
         if isinstance(message, messages.ProxyCall):
             callee = get_attr_directly(self, message.attr_path)
             return callee(*message.args, **message.kwargs)

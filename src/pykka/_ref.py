@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -11,9 +12,8 @@ from typing import (
     overload,
 )
 
-from pykka import ActorDeadError, ActorProxy
+from pykka import ActorDeadError, ActorProxy, MailboxFull
 from pykka._envelope import Envelope
-from pykka.messages import _ActorStop
 
 if TYPE_CHECKING:
     from threading import Event
@@ -80,23 +80,52 @@ class ActorRef(Generic[A]):
     def tell(
         self,
         message: Any,
+        *,
+        timeout: float | None = 0,
     ) -> None:
         """Send message to actor without waiting for any response.
 
-        Will generally not block, but if the underlying queue is full it will
-        block until a free slot is available.
+        If the actor's mailbox is unbounded, or has free capacity, the
+        message is enqueued immediately.
+
+        If the mailbox has a finite capacity and is full, the call waits up
+        to `timeout` seconds for free capacity. With the default `timeout` of
+        `0`, [`MailboxFull`][pykka.MailboxFull] is raised immediately instead.
+        Pass `None` to wait until capacity is available.
+
+        A message is never lost: either it is successfully enqueued, or an
+        exception is raised.
 
         Args:
             message: message to send
+            timeout: seconds to wait for mailbox capacity; `0` to fail
+                immediately when full, `None` to wait forever
 
         Raises:
             ActorDeadError: if actor is not available
+            MailboxFull: if a bounded mailbox is full and no capacity became
+                available in time
 
         """
+        if self._is_self_send():
+            timeout = 0
+
         if not self.is_alive():
             msg = f"{self} not found"
             raise ActorDeadError(msg)
-        self.actor_inbox.put(Envelope(message))
+        self.actor_inbox.put(Envelope(message), timeout)
+
+    def _is_self_send(self) -> bool:
+        """Return `True` if called from the actor's own consumer thread.
+
+        The actor is the mailbox's only consumer. A blocking enqueue from the
+        consumer thread of a full mailbox would deadlock, since the actor
+        would be waiting for itself to make room. Such sends are therefore
+        always made non-blocking and fail fast with
+        [`MailboxFull`][pykka.MailboxFull].
+        """
+        consumer_ident = getattr(self.actor_inbox, "consumer_ident", None)
+        return consumer_ident is not None and threading.get_ident() == consumer_ident
 
     @overload
     def ask(
@@ -143,13 +172,23 @@ class ActorRef(Generic[A]):
         an integer or float, the method will wait for a reply for `timeout`
         seconds, and then raise [`pykka.Timeout`][pykka.Timeout].
 
+        If the actor uses a bounded mailbox that is full, the method waits up
+        to `timeout` seconds for free capacity too. When `block` is `True`,
+        the `timeout` covers both waiting to enqueue and waiting for the
+        reply. If capacity never becomes available, a
+        [`MailboxFull`][pykka.MailboxFull] is raised, or set on the returned
+        future when `block` is `False`.
+
         Args:
             message: message to send
             block: whether to block while waiting for a reply
-            timeout: seconds to wait before timeout if blocking
+            timeout: seconds to wait for enqueue and/or the reply if blocking;
+                for non-blocking calls, seconds to wait for mailbox capacity
 
         Raises:
             Timeout: if timeout is reached if blocking
+            MailboxFull: if a bounded mailbox is full and no capacity became
+                available in time
             Exception: any exception returned by the receiving actor if blocking
 
         Returns:
@@ -158,14 +197,22 @@ class ActorRef(Generic[A]):
         """
         future = self.actor_class._create_future()  # noqa: SLF001
 
+        enqueue_timeout = 0.0 if self._is_self_send() else timeout
+
         try:
             if not self.is_alive():
                 msg = f"{self} not found"
                 raise ActorDeadError(msg)  # noqa: TRY301
+            self.actor_inbox.put(
+                Envelope(message, reply_to=future),
+                enqueue_timeout,
+            )
         except ActorDeadError:
             future.set_exception()
-        else:
-            self.actor_inbox.put(Envelope(message, reply_to=future))
+        except MailboxFull:
+            future.set_exception(
+                exc_info=(MailboxFull, MailboxFull("Actor mailbox is full"), None)
+            )
 
         if block:
             return future.get(timeout=timeout)
@@ -208,12 +255,14 @@ class ActorRef(Generic[A]):
         time of the call. `False` if actor was already dead. If
         `block` is `False`, it returns a future wrapping the result.
 
-        Messages sent to the actor before the actor is asked to stop will
-        be processed normally before it stops.
+        The stop signal is delivered through a channel independent of the
+        message mailbox, so a full bounded mailbox cannot delay or prevent
+        the actor from stopping.
 
-        Messages sent to the actor after the actor is asked to stop will
-        be replied to with [`ActorDeadError`][pykka.ActorDeadError] after it
-        stops.
+        Messages sent to the actor before it is asked to stop and
+        successfully enqueued are processed normally before it stops. New
+        messages arriving after the stop request are replied to with
+        [`ActorDeadError`][pykka.ActorDeadError].
 
         The actor may not be restarted.
 
@@ -223,7 +272,18 @@ class ActorRef(Generic[A]):
             a future if not blocking, or a boolean result if blocking
 
         """
-        ask_future = self.ask(_ActorStop(), block=False)
+        ask_future = self.actor_class._create_future()  # noqa: SLF001
+
+        if not self.is_alive():
+            ask_future.set_exception(
+                exc_info=(
+                    ActorDeadError,
+                    ActorDeadError(f"{self} not found"),
+                    None,
+                )
+            )
+        else:
+            self.actor_inbox.request_stop(ask_future)
 
         def _stop_result_converter(timeout: float | None) -> bool:
             try:
