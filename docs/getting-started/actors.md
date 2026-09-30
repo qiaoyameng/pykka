@@ -120,6 +120,40 @@ answer = future.get(timeout=0.1)
 # => May wait 0.1s for an answer, then raises exception if no answer.
 ```
 
+## Propagating context variables
+
+[`contextvars.ContextVar`][contextvars.ContextVar] values are not copied
+between threads by default. To propagate selected values, such as a trace ID,
+list them on the receiving actor class:
+
+```py
+import contextvars
+import pykka
+
+trace_id = contextvars.ContextVar("trace_id")
+
+
+class TracedActor(pykka.ThreadingActor):
+    propagated_context_vars = (trace_id,)
+
+    def on_receive(self, message):
+        return trace_id.get()
+```
+
+When the actor sends another message while handling a message, the current
+value of a whitelisted variable is propagated again. Changes made while
+handling a message are discarded before the next message is processed.
+
+You can also select variables for a single message:
+
+```py
+actor_ref.ask("Hi?", context_vars=(trace_id,))
+actor_ref.tell("Hi!", context_vars=(trace_id,))
+```
+
+Only the listed variables are copied. Values which are not whitelisted remain
+local to the sender thread and are never delivered with the message.
+
 ## Replying to messages
 
 If a message is sent using [`actor_ref.ask()`][pykka.ActorRef.ask] you can reply

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import abc
+import contextvars
 import logging
 import sys
 import threading
 import uuid
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
 
 from pykka import ActorDeadError, ActorRef, ActorRegistry, messages
+from pykka._context import ContextVariable, apply_message_context
 from pykka._introspection import get_attr_directly
 
 if TYPE_CHECKING:
@@ -173,6 +176,19 @@ class Actor(abc.ABC):
 
     _actor_ref: ActorRef[Any]
 
+    propagated_context_vars: ClassVar[Iterable[ContextVariable]] = ()
+    """Context variables copied from senders into handled messages."""
+
+    @classmethod
+    def _context_variables(
+        cls,
+        variables: Iterable[ContextVariable] | None,
+    ) -> tuple[ContextVariable, ...]:
+        """Return the variables selected for a single send or the actor class."""
+        if variables is not None:
+            return tuple(variables)
+        return tuple(cls.propagated_context_vars)
+
     @property
     def actor_ref(self: A) -> ActorRef[A]:
         """The actor's [`ActorRef`][pykka.ActorRef] instance."""
@@ -243,8 +259,9 @@ class Actor(abc.ABC):
 
         This is the method that will be executed by the thread or greenlet.
         """
+        baseline_context = contextvars.copy_context()
         self._actor_loop_setup()
-        self._actor_loop_running()
+        self._actor_loop_running(baseline_context)
         self._actor_loop_teardown()
 
     def _actor_loop_setup(self) -> None:
@@ -253,31 +270,39 @@ class Actor(abc.ABC):
         except Exception:  # noqa: BLE001
             self._handle_failure(*sys.exc_info())
 
-    def _actor_loop_running(self) -> None:
+    def _actor_loop_running(self, baseline_context: contextvars.Context) -> None:
         while not self.actor_stopped.is_set():
             envelope = self.actor_inbox.get()
-            try:
-                response = self._handle_receive(envelope.message)
-                if envelope.reply_to is not None:
-                    envelope.reply_to.set(response)
-            except Exception:
-                if envelope.reply_to is not None:
-                    logger.info(
-                        f"Exception returned from {self} to caller:",
-                        exc_info=sys.exc_info(),
-                    )
-                    envelope.reply_to.set_exception()
-                else:
+            message_context = apply_message_context(
+                baseline_context,
+                envelope.context,
+            )
+            message_context.run(self._handle_envelope, envelope)
+
+    def _handle_envelope(self, envelope: Envelope[Any]) -> None:
+        """Process one envelope, including failure handling and replies."""
+        try:
+            response = self._handle_receive(envelope.message)
+            if envelope.reply_to is not None:
+                envelope.reply_to.set(response)
+        except Exception:
+            if envelope.reply_to is not None:
+                logger.info(
+                    f"Exception returned from {self} to caller:",
+                    exc_info=sys.exc_info(),
+                )
+                envelope.reply_to.set_exception()
+            else:
+                self._handle_failure(*sys.exc_info())
+                try:
+                    self.on_failure(*sys.exc_info())
+                except Exception:  # noqa: BLE001
                     self._handle_failure(*sys.exc_info())
-                    try:
-                        self.on_failure(*sys.exc_info())
-                    except Exception:  # noqa: BLE001
-                        self._handle_failure(*sys.exc_info())
-            except BaseException:  # noqa: BLE001
-                exception_value = sys.exc_info()[1]
-                logger.debug(f"{exception_value!r} in {self}. Stopping all actors.")
-                self._stop()
-                ActorRegistry.stop_all()
+        except BaseException:  # noqa: BLE001
+            exception_value = sys.exc_info()[1]
+            logger.debug(f"{exception_value!r} in {self}. Stopping all actors.")
+            self._stop()
+            ActorRegistry.stop_all()
 
     def _actor_loop_teardown(self) -> None:
         while not self.actor_inbox.empty():

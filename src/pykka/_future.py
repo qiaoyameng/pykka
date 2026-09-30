@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 from collections.abc import Callable, Generator, Iterable
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast
@@ -33,11 +34,13 @@ class Future(Generic[T]):
 
     _get_hook: GetHookFunc[T] | None
     _get_hook_result: T | _Unset
+    _get_hook_context: contextvars.Context
 
     def __init__(self) -> None:
         super().__init__()
         self._get_hook = None
         self._get_hook_result = _Unset()
+        self._get_hook_context = contextvars.copy_context()
 
     def __repr__(self) -> str:
         return "<pykka.Future>"
@@ -73,7 +76,10 @@ class Future(Generic[T]):
         """
         if self._get_hook is not None:
             if isinstance(self._get_hook_result, _Unset):
-                self._get_hook_result = self._get_hook(timeout)
+                self._get_hook_result = self._get_hook_context.run(
+                    self._get_hook,
+                    timeout,
+                )
             return self._get_hook_result
         raise NotImplementedError
 
@@ -146,6 +152,7 @@ class Future(Generic[T]):
         ///
 
         """
+        self._get_hook_context = contextvars.copy_context()
         self._get_hook = func
 
     def filter(

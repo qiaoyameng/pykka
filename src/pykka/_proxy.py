@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pykka import ActorDeadError, messages
@@ -8,6 +9,7 @@ from pykka._introspection import AttrInfo, introspect_attrs
 
 if TYPE_CHECKING:
     from pykka import Actor, ActorRef, Future
+    from pykka._context import ContextVariable
     from pykka._types import AttrPath
 
 __all__ = ["ActorProxy"]
@@ -253,6 +255,7 @@ class CallableProxy(Generic[A]):
     def __call__(
         self,
         *args: Any,
+        context_vars: Iterable[ContextVariable] | None = None,
         **kwargs: Any,
     ) -> Future[Any]:
         """Call with [`ask()`][pykka.ActorRef.ask] semantics.
@@ -267,11 +270,16 @@ class CallableProxy(Generic[A]):
         message = messages.ProxyCall(
             attr_path=self._attr_path, args=args, kwargs=kwargs
         )
-        return self.actor_ref.ask(message, block=False)
+        return self.actor_ref.ask(
+            message,
+            block=False,
+            context_vars=context_vars,
+        )
 
     def defer(
         self,
         *args: Any,
+        context_vars: Iterable[ContextVariable] | None = None,
         **kwargs: Any,
     ) -> None:
         """Call with [`tell()`][pykka.ActorRef.tell] semantics.
@@ -288,7 +296,7 @@ class CallableProxy(Generic[A]):
         message = messages.ProxyCall(
             attr_path=self._attr_path, args=args, kwargs=kwargs
         )
-        self.actor_ref.tell(message)
+        self.actor_ref.tell(message, context_vars=context_vars)
 
 
 def traversable(obj: T) -> T:
