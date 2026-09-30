@@ -4,7 +4,7 @@ import logging as _logging
 
 from pykka._exceptions import ActorDeadError, Timeout
 from pykka._future import Future, get_all
-from pykka._proxy import ActorProxy, CallableProxy, traversable
+from pykka._proxy import ActorProxy, BatchProxy, CallableProxy, traversable
 from pykka._ref import ActorRef
 from pykka._registry import ActorRegistry
 
@@ -19,6 +19,7 @@ __all__ = [
     "ActorProxy",
     "ActorRef",
     "ActorRegistry",
+    "BatchProxy",
     "CallableProxy",
     "Future",
     "ThreadingActor",

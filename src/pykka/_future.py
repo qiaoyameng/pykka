@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import threading
 from collections.abc import Callable, Generator, Iterable
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast
 
 if TYPE_CHECKING:
+    from pykka import ActorRef
     from pykka._types import OptExcInfo
 
 __all__ = ["Future", "get_all"]
@@ -22,6 +24,33 @@ class _Unset:
     pass
 
 
+_batch_context = threading.local()
+
+
+class _BatchExecution:
+    """Context manager marking the current thread as executing a proxy batch.
+
+    Internal. While active, [`Future.get()`][pykka.Future.get] refuses to
+    block on futures awaiting a reply from the actor executing the batch,
+    since the actor cannot process new messages until the batch completes,
+    and blocking would deadlock the actor.
+    """
+
+    def __init__(
+        self,
+        actor_ref: ActorRef[Any],
+    ) -> None:
+        self._actor_ref = actor_ref
+        self._previous: ActorRef[Any] | None = None
+
+    def __enter__(self) -> None:
+        self._previous = getattr(_batch_context, "actor_ref", None)
+        _batch_context.actor_ref = self._actor_ref
+
+    def __exit__(self, *_args: Any) -> None:
+        _batch_context.actor_ref = self._previous
+
+
 class Future(Generic[T]):
     """A handle to a value which is available now or in the future.
 
@@ -33,6 +62,8 @@ class Future(Generic[T]):
 
     _get_hook: GetHookFunc[T] | None
     _get_hook_result: T | _Unset
+
+    _pykka_actor_ref: ActorRef[Any] | None = None
 
     def __init__(self) -> None:
         super().__init__()
@@ -71,6 +102,15 @@ class Future(Generic[T]):
             encapsulated value if it is not an exception
 
         """
+        batch_actor_ref = getattr(_batch_context, "actor_ref", None)
+        if batch_actor_ref is not None and self._pykka_actor_ref is batch_actor_ref:
+            msg = (
+                f"Cannot block waiting for a reply from {batch_actor_ref} "
+                f"while the actor is executing a proxy batch. "
+                f"The actor cannot process the message until the batch "
+                f"completes, so waiting for it would deadlock the actor."
+            )
+            raise RuntimeError(msg)
         if self._get_hook is not None:
             if isinstance(self._get_hook_result, _Unset):
                 self._get_hook_result = self._get_hook(timeout)

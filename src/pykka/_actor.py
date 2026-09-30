@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pykka import ActorDeadError, ActorRef, ActorRegistry, messages
+from pykka._future import _BatchExecution
 from pykka._introspection import get_attr_directly
 
 if TYPE_CHECKING:
@@ -372,17 +373,58 @@ class Actor(abc.ABC):
         """Handle messages sent to the actor."""
         if isinstance(message, messages._ActorStop):  # noqa: SLF001
             return self._stop()
-        if isinstance(message, messages.ProxyCall):
-            callee = get_attr_directly(self, message.attr_path)
-            return callee(*message.args, **message.kwargs)
-        if isinstance(message, messages.ProxyGetAttr):
-            attr = get_attr_directly(self, message.attr_path)
-            return attr
-        if isinstance(message, messages.ProxySetAttr):
-            parent_attr = get_attr_directly(self, message.attr_path[:-1])
-            attr_name = message.attr_path[-1]
-            return setattr(parent_attr, attr_name, message.value)
+        if isinstance(message, messages.ProxyBatch):
+            return self._handle_proxy_batch(message)
+        if isinstance(
+            message,
+            (messages.ProxyCall, messages.ProxyGetAttr, messages.ProxySetAttr),
+        ):
+            return self._handle_proxy_operation(message)
         return self.on_receive(message)
+
+    def _handle_proxy_operation(
+        self,
+        operation: messages.ProxyBatchOperation,
+    ) -> Any:
+        """Handle a single proxy operation message."""
+        if isinstance(operation, messages.ProxyCall):
+            callee = get_attr_directly(self, operation.attr_path)
+            return callee(*operation.args, **operation.kwargs)
+        if isinstance(operation, messages.ProxyGetAttr):
+            attr = get_attr_directly(self, operation.attr_path)
+            return attr
+        parent_attr = get_attr_directly(self, operation.attr_path[:-1])
+        attr_name = operation.attr_path[-1]
+        return setattr(parent_attr, attr_name, operation.value)
+
+    def _handle_proxy_batch(
+        self,
+        message: messages.ProxyBatch,
+    ) -> list[Any]:
+        """Handle a batch of proxy operations as a single message.
+
+        The operations are executed in order without processing any other
+        messages in between. The returned list has one result per operation,
+        in the same order as the operations.
+
+        If `on_error` is `"stop"`, the first exception aborts the batch and
+        is reraised, so that it is set on the reply future. Side effects of
+        operations already executed are not rolled back.
+
+        If `on_error` is `"continue"`, all operations are executed, and the
+        exception instance is placed at the operation's position in the
+        returned list.
+        """
+        results: list[Any] = []
+        with _BatchExecution(self.actor_ref):
+            for operation in message.operations:
+                try:
+                    results.append(self._handle_proxy_operation(operation))
+                except Exception:
+                    if message.on_error == "stop":
+                        raise
+                    results.append(sys.exc_info()[1])
+        return results
 
     def on_receive(self, message: Any) -> Any:
         """May be implemented for the actor to handle regular non-proxy messages.

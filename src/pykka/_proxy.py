@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, overload
 
 from pykka import ActorDeadError, messages
 from pykka._introspection import AttrInfo, introspect_attrs
@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from pykka import Actor, ActorRef, Future
     from pykka._types import AttrPath
 
-__all__ = ["ActorProxy"]
+__all__ = ["ActorProxy", "BatchProxy"]
 
 
 logger = logging.getLogger("pykka")
@@ -216,6 +216,240 @@ class ActorProxy(Generic[A]):
         attr_path = (*self._attr_path, name)
         message = messages.ProxySetAttr(attr_path=attr_path, value=value)
         self.actor_ref.ask(message)
+        return None
+
+    def batch(
+        self,
+        *,
+        on_error: Literal["stop", "continue"] = "stop",
+    ) -> BatchProxy[A]:
+        """Create a batch of operations to execute as a single actor message.
+
+        Reading several attributes and calling several methods through a
+        regular proxy sends one inbox message per operation, so other
+        messages may be processed by the actor in between them. A batch
+        records the operations and sends them as a single inbox message,
+        so no other messages are processed by the actor in between them.
+
+        Example:
+            ```py
+            proxy = AnActor.start().proxy()
+
+            batch = proxy.batch()
+            batch.some_attr            # records an attribute read
+            batch.a_method(1, x=2)     # records a method call
+            batch.other_attr = "foo"   # records an attribute assignment
+
+            results = batch.execute().get()
+            ```
+
+        [`execute()`][pykka.BatchProxy.execute] returns a future for a list
+        with one result per recorded operation, in the order the operations
+        were recorded.
+
+        Args:
+            on_error: `"stop"` aborts the batch at the first failing
+                operation and reraises its exception when the result is
+                retrieved. `"continue"` executes all operations and places
+                the exception instance at the failing operation's position
+                in the result list.
+
+        Returns:
+            a [`BatchProxy`][pykka.BatchProxy] recording operations for this
+            proxy's actor.
+
+        """
+        return BatchProxy(proxy=self, on_error=on_error)
+
+
+class BatchProxy(Generic[A]):
+    """Records proxy operations and executes them as a single actor message.
+
+    Created by [`ActorProxy.batch()`][pykka.ActorProxy.batch]. See its
+    documentation for an example.
+
+    Attribute reads, method calls, and attribute assignments are recorded
+    instead of sent. Attribute paths follow the same rules as for
+    [`ActorProxy`][pykka.ActorProxy]: only attributes marked with
+    [`pykka.traversable()`][pykka.traversable] can be traversed.
+
+    The recorded operations are sent to the actor as a single inbox message
+    by [`execute()`][pykka.BatchProxy.execute]. While the actor executes the
+    batch, it cannot process any other messages. This also means that code
+    run by the batch must not block waiting for a future replied to by the
+    same actor, as that would deadlock the actor. Pykka detects this and
+    raises [`RuntimeError`][RuntimeError] instead of deadlocking.
+
+    Batches are *not* transactions. If an operation fails, the side effects
+    of the operations already executed are not rolled back.
+    """
+
+    _proxy: ActorProxy[A]
+    _attr_path: AttrPath
+    _operations: list[messages.ProxyBatchOperation]
+    _on_error: Literal["stop", "continue"]
+
+    def __init__(
+        self,
+        *,
+        proxy: ActorProxy[A],
+        attr_path: AttrPath | None = None,
+        operations: list[messages.ProxyBatchOperation] | None = None,
+        on_error: Literal["stop", "continue"] = "stop",
+    ) -> None:
+        if on_error not in ("stop", "continue"):
+            msg = f"on_error must be 'stop' or 'continue', not {on_error!r}"
+            raise ValueError(msg)
+        self._proxy = proxy
+        self._attr_path = attr_path or proxy._attr_path  # noqa: SLF001
+        self._operations = operations if operations is not None else []
+        self._on_error = on_error
+
+    def __repr__(self) -> str:
+        return (
+            f"<BatchProxy for {self._proxy.actor_ref}, "
+            f"attr_path={self._attr_path!r}, "
+            f"operations={len(self._operations)}>"
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Record a field read, or get a callable or traversable recorder."""
+        proxy = self._proxy
+        attr_path: AttrPath = (*self._attr_path, name)
+
+        known_attrs = proxy._known_attrs  # noqa: SLF001
+        if attr_path not in known_attrs:
+            proxy._known_attrs = known_attrs = introspect_attrs(  # noqa: SLF001
+                root=proxy._actor,  # noqa: SLF001
+                proxy=proxy,
+            )
+
+        attr_info = known_attrs.get(attr_path)
+        if attr_info is None:
+            msg = f"{self} has no attribute {name!r}"
+            raise AttributeError(msg)
+
+        if attr_info.callable:
+            return _BatchCallableProxy(batch=self, attr_path=attr_path)
+
+        if attr_info.traversable:
+            return BatchProxy(
+                proxy=proxy,
+                attr_path=attr_path,
+                operations=self._operations,
+                on_error=self._on_error,
+            )
+
+        self._operations.append(messages.ProxyGetAttr(attr_path=attr_path))
+        return None
+
+    def __setattr__(
+        self,
+        name: str,
+        value: Any,
+    ) -> None:
+        """Record a field assignment."""
+        if name.startswith("_"):
+            return super().__setattr__(name, value)
+        attr_path = (*self._attr_path, name)
+        self._operations.append(messages.ProxySetAttr(attr_path=attr_path, value=value))
+        return None
+
+    @overload
+    def execute(
+        self,
+        *,
+        block: Literal[False],
+        timeout: float | None = None,
+    ) -> Future[list[Any]]: ...
+
+    @overload
+    def execute(
+        self,
+        *,
+        block: Literal[True],
+        timeout: float | None = None,
+    ) -> list[Any]: ...
+
+    @overload
+    def execute(
+        self,
+        *,
+        block: bool = False,
+        timeout: float | None = None,
+    ) -> Future[list[Any]] | list[Any]: ...
+
+    def execute(
+        self,
+        *,
+        block: bool = False,
+        timeout: float | None = None,
+    ) -> Future[list[Any]] | list[Any]:
+        """Send the recorded operations to the actor as a single message.
+
+        The actor executes the operations in order, without processing any
+        other messages in between.
+
+        With `on_error="stop"`, the first failing operation aborts the
+        batch, and its exception is reraised by
+        [`get()`][pykka.Future.get] on the returned future. The remaining
+        operations are not executed. Side effects of operations already
+        executed are *not* rolled back.
+
+        With `on_error="continue"`, all operations are executed, and the
+        result list contains the exception instance at the position of each
+        failed operation.
+
+        Args:
+            block: whether to block while waiting for the results
+            timeout: seconds to wait before timeout if blocking
+
+        Raises:
+            ValueError: if the batch has no recorded operations
+            Timeout: if timeout is reached if blocking
+            Exception: any exception from the first failing operation, if
+                blocking and `on_error` is `"stop"`
+
+        Returns:
+            a future for the list of results if not blocking, or the list
+            of results if blocking, with one result per recorded operation,
+            in the order the operations were recorded
+
+        """
+        if not self._operations:
+            msg = "Cannot execute a batch with no operations"
+            raise ValueError(msg)
+        message = messages.ProxyBatch(
+            operations=tuple(self._operations),
+            on_error=self._on_error,
+        )
+        return self._proxy.actor_ref.ask(message, block=block, timeout=timeout)
+
+
+class _BatchCallableProxy(Generic[A]):
+    """Records a method call in a batch instead of sending it."""
+
+    _batch: BatchProxy[A]
+    _attr_path: AttrPath
+
+    def __init__(
+        self,
+        *,
+        batch: BatchProxy[A],
+        attr_path: AttrPath,
+    ) -> None:
+        self._batch = batch
+        self._attr_path = attr_path
+
+    def __call__(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Record the method call in the batch."""
+        self._batch._operations.append(  # noqa: SLF001
+            messages.ProxyCall(attr_path=self._attr_path, args=args, kwargs=kwargs)
+        )
         return None
 
 

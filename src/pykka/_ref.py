@@ -157,6 +157,7 @@ class ActorRef(Generic[A]):
 
         """
         future = self.actor_class._create_future()  # noqa: SLF001
+        future._pykka_actor_ref = self  # noqa: SLF001
 
         try:
             if not self.is_alive():
