@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import abc
 import logging
+import queue
 import sys
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pykka import ActorDeadError, ActorRef, ActorRegistry, messages
+from pykka._deferred import DeferredReplyHandle
 from pykka._introspection import get_attr_directly
 
 if TYPE_CHECKING:
@@ -214,6 +216,8 @@ class Actor(abc.ABC):
         self.actor_urn = uuid.uuid4().urn
         self.actor_inbox = self._create_actor_inbox()
         self.actor_stopped = threading.Event()
+        self._deferred_replies_lock = threading.Lock()
+        self._deferred_replies: set[DeferredReplyHandle[Any]] = set()
 
         self._actor_ref = ActorRef(self)
 
@@ -232,6 +236,7 @@ class Actor(abc.ABC):
         """Stop the actor immediately without processing the rest of the inbox."""
         ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
+        self._terminate_deferred_replies()
         logger.debug(f"Stopped {self}")
         try:
             self.on_stop()
@@ -258,19 +263,26 @@ class Actor(abc.ABC):
             envelope = self.actor_inbox.get()
             try:
                 response = self._handle_receive(envelope.message)
-                if envelope.reply_to is not None:
-                    envelope.reply_to.set(response)
+                self._handle_response(response, envelope.reply_to)
             except Exception:
+                exc_info = sys.exc_info()
                 if envelope.reply_to is not None:
                     logger.info(
                         f"Exception returned from {self} to caller:",
-                        exc_info=sys.exc_info(),
+                        exc_info=exc_info,
                     )
-                    envelope.reply_to.set_exception()
-                else:
-                    self._handle_failure(*sys.exc_info())
                     try:
-                        self.on_failure(*sys.exc_info())
+                        envelope.reply_to.set_exception(exc_info)
+                    except queue.Full:
+                        self._handle_failure(*exc_info)
+                        try:
+                            self.on_failure(*exc_info)
+                        except Exception:  # noqa: BLE001
+                            self._handle_failure(*sys.exc_info())
+                else:
+                    self._handle_failure(*exc_info)
+                    try:
+                        self.on_failure(*exc_info)
                     except Exception:  # noqa: BLE001
                         self._handle_failure(*sys.exc_info())
             except BaseException:  # noqa: BLE001
@@ -280,6 +292,7 @@ class Actor(abc.ABC):
                 ActorRegistry.stop_all()
 
     def _actor_loop_teardown(self) -> None:
+        self._terminate_deferred_replies()
         while not self.actor_inbox.empty():
             envelope = self.actor_inbox.get()
             if envelope.reply_to is not None:
@@ -338,12 +351,13 @@ class Actor(abc.ABC):
         traceback: TracebackType | None,
     ) -> None:
         """Log unexpected failures, unregisters and stops the actor."""
+        ActorRegistry.unregister(self.actor_ref)
+        self.actor_stopped.set()
+        self._terminate_deferred_replies()
         logger.error(
             f"Unhandled exception in {self}:",
             exc_info=(exception_type, exception_value, traceback),  # type: ignore[arg-type]   # ty: ignore[invalid-argument-type]
         )
-        ActorRegistry.unregister(self.actor_ref)
-        self.actor_stopped.set()
 
     def on_failure(  # noqa: B027
         self,
@@ -384,6 +398,42 @@ class Actor(abc.ABC):
             return setattr(parent_attr, attr_name, message.value)
         return self.on_receive(message)
 
+    def _handle_response(
+        self,
+        response: Any,
+        reply_to: Future[Any] | None,
+    ) -> None:
+        if reply_to is None:
+            return
+        if isinstance(response, DeferredReplyHandle):
+            bound = response._bind(  # noqa: SLF001
+                reply_to,
+                self._add_deferred_reply,
+                self._remove_deferred_reply,
+            )
+            return
+        reply_to.set(response)
+
+    def _terminate_deferred_replies(self) -> None:
+        with self._deferred_replies_lock:
+            deferred_replies = list(self._deferred_replies)
+        for deferred_reply in deferred_replies:
+            deferred_reply._terminate(str(self.actor_ref))  # noqa: SLF001
+
+    def _add_deferred_reply(
+        self,
+        deferred_reply: DeferredReplyHandle[Any],
+    ) -> None:
+        with self._deferred_replies_lock:
+            self._deferred_replies.add(deferred_reply)
+
+    def _remove_deferred_reply(
+        self,
+        deferred_reply: DeferredReplyHandle[Any],
+    ) -> None:
+        with self._deferred_replies_lock:
+            self._deferred_replies.discard(deferred_reply)
+
     def on_receive(self, message: Any) -> Any:
         """May be implemented for the actor to handle regular non-proxy messages.
 
@@ -391,7 +441,8 @@ class Actor(abc.ABC):
             message: the message to handle
 
         Returns:
-            anything that should be sent as a reply to the sender
+            anything that should be sent as a reply to the sender, or a
+            deferred reply handle to complete the request later
 
         """
         logger.warning(f"Unexpected message received by {self}: {message}")

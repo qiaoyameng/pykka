@@ -142,6 +142,49 @@ print(answer)
 # => "Hi there!"
 ```
 
+If completing the answer requires waiting for another message or external
+event, return a deferred reply handle instead of blocking
+[`on_receive()`][pykka.Actor.on_receive]. The actor will continue processing
+its inbox, and the handle can complete the original request later:
+
+```py
+import pykka
+
+
+class EventualActor(pykka.ThreadingActor):
+    def __init__(self):
+        super().__init__()
+        self.query_reply = None
+
+    def on_receive(self, message):
+        if message == "query":
+            self.query_reply = pykka.DeferredReplyHandle()
+            return self.query_reply
+        if message == "update":
+            self.query_reply.set("updated result")
+
+
+actor_ref = EventualActor.start()
+answer = actor_ref.ask("query", block=False)
+
+# The actor can still process this message.
+actor_ref.tell("update")
+
+print(answer.get())
+# => "updated result"
+```
+
+A handle can only be completed once. Complete it with an exception using
+[`DeferredReplyHandle.set_exception()`][pykka.DeferredReplyHandle.set_exception].
+
+A caller timing out does not cancel the business operation. The original
+future can still be completed later. If cancellation needs to stop the
+business operation, model it explicitly and pass an optional `on_cancel`
+callback when creating the handle, then call
+[`DeferredReplyHandle.cancel()`][pykka.DeferredReplyHandle.cancel]. If the
+actor stops first, pending replies fail with
+[`ActorDeadError`][pykka.ActorDeadError].
+
 /// note | Returning `None`
 `None` is a valid response,
 so if you return `None` explicitly, or don't return at all,
