@@ -5,6 +5,7 @@ from collections.abc import Callable, Generator, Iterable
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast
 
 if TYPE_CHECKING:
+    from pykka._exceptions import CancelledError
     from pykka._types import OptExcInfo
 
 __all__ = ["Future", "get_all"]
@@ -16,6 +17,7 @@ M = TypeVar("M")  # Result of Future.map()
 R = TypeVar("R")  # Result of Future.reduce()
 
 GetHookFunc: TypeAlias = Callable[[float | None], T]
+CancelHookFunc: TypeAlias = Callable[[], Any]
 
 
 class _Unset:
@@ -120,6 +122,31 @@ class Future(Generic[T]):
         set now raises an exception.
         ///
 
+        """
+        raise NotImplementedError
+
+    def cancel(self) -> bool:
+        """Cancel the future.
+
+        If the future does not yet have a result, its result is set to
+        [`CancelledError`][pykka.CancelledError], `True` is returned, and any
+        cancellation hook registered by the actor is called.
+
+        If the future already has a result, including a timeout experienced by
+        a caller, no change is made and `False` is returned.
+
+        Returns:
+            `True` if the future was cancelled, otherwise `False`
+        """
+        raise NotImplementedError
+
+    def _set_cancel_hook(
+        self,
+        func: CancelHookFunc,
+    ) -> bool:
+        """Register a cancellation hook.
+
+        Returns `True` if the future was already cancelled, otherwise `False`.
         """
         raise NotImplementedError
 

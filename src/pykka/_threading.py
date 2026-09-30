@@ -8,6 +8,7 @@ from itertools import count
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 from pykka import Actor, Future, Timeout
+from pykka._exceptions import CancelledError
 
 if TYPE_CHECKING:
     from pykka._actor import ActorInbox
@@ -47,6 +48,7 @@ class ThreadingFuture(Future[T]):
         super().__init__()
         self._condition: threading.Condition = threading.Condition()
         self._result: ThreadingFutureResult | None = None
+        self._cancel_hook: CancelHookFunc | None = None
 
     def get(
         self,
@@ -114,6 +116,43 @@ class ThreadingFuture(Future[T]):
                 raise queue.Full
             super().set_get_hook(func)
             self._condition.notify_all()
+
+    def cancel(self) -> bool:
+        with self._condition:
+            if self._result is not None or self._get_hook is not None:
+                return False
+
+            self._result = ThreadingFutureResult(
+                exc_info=(
+                    CancelledError,
+                    CancelledError("Future was cancelled"),
+                    None,
+                )
+            )
+            hook = self._cancel_hook
+            self._condition.notify_all()
+
+        if hook is not None:
+            hook()
+        return True
+
+    def _set_cancel_hook(
+        self,
+        func: CancelHookFunc,
+    ) -> bool:
+        with self._condition:
+            if self._result is not None:
+                result = self._result
+                if result.exc_info is None:
+                    return False
+                exc_type = result.exc_info[0]
+                assert exc_type is not None
+                return issubclass(exc_type, CancelledError)
+            elif self._get_hook is not None or self._cancel_hook is not None:
+                raise queue.Full
+            else:
+                self._cancel_hook = func
+                return False
 
 
 _actor_thread_counter = count(0)

@@ -1,8 +1,12 @@
-__all__ = ["ActorDeadError", "Timeout"]
+__all__ = ["ActorDeadError", "CancelledError", "Timeout"]
 
 
 class ActorDeadError(Exception):
     """Exception raised when trying to use a dead or unavailable actor."""
+
+
+class CancelledError(Exception):
+    """Exception raised when a future is cancelled."""
 
 
 class Timeout(Exception):  # noqa: N818

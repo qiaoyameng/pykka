@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pykka import ActorDeadError, ActorRef, ActorRegistry, messages
+from pykka._deferred import DeferredReply
 from pykka._introspection import get_attr_directly
 
 if TYPE_CHECKING:
@@ -214,6 +215,8 @@ class Actor(abc.ABC):
         self.actor_urn = uuid.uuid4().urn
         self.actor_inbox = self._create_actor_inbox()
         self.actor_stopped = threading.Event()
+        self._pending_deferred_replies: set[DeferredReply[Any]] = set()
+        self._pending_deferred_replies_lock = threading.Lock()
 
         self._actor_ref = ActorRef(self)
 
@@ -258,7 +261,13 @@ class Actor(abc.ABC):
             envelope = self.actor_inbox.get()
             try:
                 response = self._handle_receive(envelope.message)
-                if envelope.reply_to is not None:
+                if isinstance(response, DeferredReply):
+                    response._bind(  # noqa: SLF001
+                        envelope.reply_to,
+                        self._pending_deferred_replies,
+                        self._pending_deferred_replies_lock,
+                    )
+                elif envelope.reply_to is not None:
                     envelope.reply_to.set(response)
             except Exception:
                 if envelope.reply_to is not None:
@@ -280,6 +289,8 @@ class Actor(abc.ABC):
                 ActorRegistry.stop_all()
 
     def _actor_loop_teardown(self) -> None:
+        self._fail_pending_deferred_replies()
+
         while not self.actor_inbox.empty():
             envelope = self.actor_inbox.get()
             if envelope.reply_to is not None:
@@ -295,6 +306,24 @@ class Actor(abc.ABC):
                             None,
                         )
                     )
+
+    def _fail_pending_deferred_replies(self) -> None:
+        with self._pending_deferred_replies_lock:
+            pending_replies = list(self._pending_deferred_replies)
+            self._pending_deferred_replies.clear()
+
+        if not pending_replies:
+            return
+
+        exc_info = (
+            ActorDeadError,
+            ActorDeadError(
+                f"{self.actor_ref} stopped before completing the deferred reply"
+            ),
+            None,
+        )
+        for reply in pending_replies:
+            reply._fail(exc_info)  # noqa: SLF001
 
     def on_start(self) -> None:  # noqa: B027
         """Run code at the beginning of the actor's life.
@@ -386,6 +415,9 @@ class Actor(abc.ABC):
 
     def on_receive(self, message: Any) -> Any:
         """May be implemented for the actor to handle regular non-proxy messages.
+
+        Return a [`DeferredReply`][pykka.DeferredReply] to provide the reply
+        later without blocking processing of subsequent inbox messages.
 
         Args:
             message: the message to handle

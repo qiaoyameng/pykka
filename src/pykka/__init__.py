@@ -2,7 +2,8 @@
 
 import logging as _logging
 
-from pykka._exceptions import ActorDeadError, Timeout
+from pykka._deferred import DeferredReply
+from pykka._exceptions import ActorDeadError, CancelledError, Timeout
 from pykka._future import Future, get_all
 from pykka._proxy import ActorProxy, CallableProxy, traversable
 from pykka._ref import ActorRef
@@ -20,6 +21,8 @@ __all__ = [
     "ActorRef",
     "ActorRegistry",
     "CallableProxy",
+    "CancelledError",
+    "DeferredReply",
     "Future",
     "ThreadingActor",
     "ThreadingFuture",

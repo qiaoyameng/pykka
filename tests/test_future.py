@@ -46,6 +46,13 @@ def test_base_future_set_exception_is_not_implemented() -> None:
         future.set_exception(None)
 
 
+def test_base_future_cancel_is_not_implemented() -> None:
+    future: Future[Any] = Future()
+
+    with pytest.raises(NotImplementedError):
+        future.cancel()
+
+
 def test_set_multiple_times_fails(
     future: Future[int],
 ) -> None:

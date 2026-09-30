@@ -176,3 +176,72 @@ except Exception as e:
     print(repr(e))
     # => Exception("Oops")
 ```
+
+### Replying later
+
+Sometimes an actor cannot produce the reply until another external event or
+inbox message has arrived. It must not block
+[`on_receive()`][pykka.Actor.on_receive] while waiting, because that would
+prevent the actor from processing the event it is waiting for.
+
+Return a [`DeferredReply`][pykka.DeferredReply] instead. The caller gets the
+usual [`Future`][pykka.Future] from
+[`ask(block=False)`][pykka.ActorRef.ask], while the actor keeps processing
+messages. A later message or external event can complete the handle:
+
+```py
+import pykka
+
+
+class EventActor(pykka.ThreadingActor):
+    def __init__(self):
+        super().__init__()
+        self.pending = {}
+
+    def on_receive(self, message):
+        if message["type"] == "query":
+            reply = pykka.DeferredReply()
+            self.pending[message["id"]] = reply
+            return reply
+
+        if message["type"] == "update":
+            self.pending.pop(message["id"]).set(message["value"])
+
+
+actor_ref = EventActor.start()
+answer = actor_ref.ask({"type": "query", "id": 1}, block=False)
+
+# The query does not block this update from being processed.
+actor_ref.tell({"type": "update", "id": 1, "value": "ready"})
+print(answer.get())
+# => ready
+```
+
+The handle can be completed once, either successfully with
+[`DeferredReply.set()`][pykka.DeferredReply.set] or with an exception using
+[`DeferredReply.set_exception()`][pykka.DeferredReply.set_exception]. If the
+actor stops first, every request still waiting for a deferred reply receives
+[`ActorDeadError`][pykka.ActorDeadError].
+
+### Cancellation
+
+A caller timing out with [`Future.get(timeout=...)`][pykka.Future.get] only
+stops waiting; it does not cancel the actor's business operation. The actor can
+still complete the same future later.
+
+To support cancellation, provide an `on_cancel` callback when creating the
+handle and call [`Future.cancel()`][pykka.Future.cancel] explicitly. The
+callback is the actor-facing part of cancellation, so it should normally just
+send another message to the actor:
+
+```py
+reply = pykka.DeferredReply(
+    on_cancel=lambda: self.actor_ref.tell(
+        {"type": "cancel", "id": query_id}
+    )
+)
+```
+
+If the future is cancelled before it completes, the caller receives
+[`CancelledError`][pykka.CancelledError] and the actor receives the cancellation
+message. If the reply is completed first, cancellation has no effect.
