@@ -8,13 +8,13 @@ import uuid
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pykka import ActorDeadError, ActorRef, ActorRegistry, messages
+from pykka._envelope import Envelope
 from pykka._introspection import get_attr_directly
 
 if TYPE_CHECKING:
     from types import TracebackType
 
     from pykka import Future
-    from pykka._envelope import Envelope
 
 __all__ = ["Actor"]
 
@@ -154,6 +154,33 @@ class Actor(abc.ABC):
         msg = "Use a subclass of Actor"
         raise NotImplementedError(msg)
 
+    @classmethod
+    def _start_supervised(
+        cls: type[A],
+        supervisor: Actor,
+        entry: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ActorRef[A]:
+        """Start the actor as a supervised child.
+
+        Unlike [`start()`][pykka.Actor.start], the returned ref stays
+        registered and alive across restarts; it is rebound to each new
+        incarnation by the supervisor.
+        """
+        obj = cls(*args, **kwargs)
+        assert obj.actor_ref is not None, (
+            "Actor.__init__() have not been called. "
+            "Did you forget to call super() in your override?"
+        )
+        obj._supervisor_entry = entry  # noqa: SLF001
+        entry.supervisor_ref = supervisor.actor_ref
+        obj.actor_ref._bind_supervised(obj)  # noqa: SLF001
+        ActorRegistry.register(obj.actor_ref)
+        logger.debug(f"Starting supervised {obj} as {entry.name}")
+        obj._start_actor_loop()
+        return obj.actor_ref
+
     actor_urn: str
     """
     The actor URN string is a universally unique identifier for the actor.
@@ -214,8 +241,13 @@ class Actor(abc.ABC):
         self.actor_urn = uuid.uuid4().urn
         self.actor_inbox = self._create_actor_inbox()
         self.actor_stopped = threading.Event()
+        self._incarnation_ended = threading.Event()
 
         self._actor_ref = ActorRef(self)
+
+        self._failed = False
+        self._restarting = False
+        self._supervisor_entry: Any | None = None
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__} ({self.actor_urn})"
@@ -230,7 +262,15 @@ class Actor(abc.ABC):
 
     def _stop(self) -> None:
         """Stop the actor immediately without processing the rest of the inbox."""
-        ActorRegistry.unregister(self.actor_ref)
+        runtime = getattr(self, "_supervisor_runtime", None)
+        if runtime is not None:
+            runtime.stop_all()
+
+        supervised_dying = self._supervisor_entry is not None and (
+            self._restarting or self._failed
+        )
+        if not supervised_dying:
+            ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
         logger.debug(f"Stopped {self}")
         try:
@@ -243,15 +283,27 @@ class Actor(abc.ABC):
 
         This is the method that will be executed by the thread or greenlet.
         """
-        self._actor_loop_setup()
-        self._actor_loop_running()
-        self._actor_loop_teardown()
+        try:
+            self._actor_loop_setup()
+            self._actor_loop_running()
+            self._actor_loop_teardown()
+        finally:
+            self._incarnation_ended.set()
+            self._notify_supervisor()
 
     def _actor_loop_setup(self) -> None:
+        runtime = getattr(self, "_supervisor_runtime", None)
         try:
+            if runtime is not None:
+                runtime.start_all()
             self.on_start()
         except Exception:  # noqa: BLE001
-            self._handle_failure(*sys.exc_info())
+            try:
+                self._handle_failure(*sys.exc_info())
+            finally:
+                if runtime is not None:
+                    runtime.stop_all()
+                    self.actor_stopped.set()
 
     def _actor_loop_running(self) -> None:
         while not self.actor_stopped.is_set():
@@ -280,8 +332,29 @@ class Actor(abc.ABC):
                 ActorRegistry.stop_all()
 
     def _actor_loop_teardown(self) -> None:
+        if self._supervisor_entry is not None and (
+            self._failed or self._restarting
+        ):
+            if self._restarting and not self._failed:
+                try:
+                    self.on_stop()
+                except Exception:  # noqa: BLE001
+                    self._handle_failure(*sys.exc_info())
+            while not self.actor_inbox.empty():
+                envelope = self.actor_inbox.get()
+                self._supervisor_entry.stashed_envelopes.append(envelope)
+            return
+
+        pending: list[Envelope[Any]] = []
         while not self.actor_inbox.empty():
             envelope = self.actor_inbox.get()
+            pending.append(envelope)
+
+        runtime = getattr(self, "_supervisor_runtime", None)
+        if runtime is not None and self._failed:
+            runtime.stop_all()
+
+        for envelope in pending:
             if envelope.reply_to is not None:
                 if isinstance(envelope.message, messages._ActorStop):  # noqa: SLF001
                     envelope.reply_to.set(None)
@@ -295,6 +368,25 @@ class Actor(abc.ABC):
                             None,
                         )
                     )
+
+    def _notify_supervisor(self) -> None:
+        entry = self._supervisor_entry
+        if entry is None:
+            return
+        supervisor_ref = entry.supervisor_ref
+        supervisor_actor = supervisor_ref._actor_weakref()  # noqa: SLF001
+        if supervisor_actor is None:
+            ActorRegistry.unregister(self.actor_ref)
+            return
+        message = messages._ChildTerminated(
+            name=entry.name,
+            failed=self._failed,
+            generation=entry.generation,
+        )
+        try:
+            supervisor_ref.tell(message)
+        except ActorDeadError:
+            ActorRegistry.unregister(self.actor_ref)
 
     def on_start(self) -> None:  # noqa: B027
         """Run code at the beginning of the actor's life.
@@ -337,12 +429,17 @@ class Actor(abc.ABC):
         exception_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Log unexpected failures, unregisters and stops the actor."""
+        """Log unexpected failures and stops the current incarnation."""
         logger.error(
             f"Unhandled exception in {self}:",
             exc_info=(exception_type, exception_value, traceback),  # type: ignore[arg-type]   # ty: ignore[invalid-argument-type]
         )
-        ActorRegistry.unregister(self.actor_ref)
+        self._failed = True
+        entry = self._supervisor_entry
+        if entry is not None:
+            entry.last_failure = exception_value
+        if entry is None:
+            ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
 
     def on_failure(  # noqa: B027
@@ -370,6 +467,17 @@ class Actor(abc.ABC):
 
     def _handle_receive(self, message: Any) -> Any:
         """Handle messages sent to the actor."""
+        if isinstance(message, messages._SupervisedRestart):  # noqa: SLF001
+            return self._handle_supervised_restart()
+        if isinstance(message, messages._ChildTerminated):  # noqa: SLF001
+            runtime = getattr(self, "_supervisor_runtime", None)
+            if runtime is not None:
+                runtime.on_child_terminated(
+                    message.name,
+                    message.failed,
+                    message.generation,
+                )
+            return None
         if isinstance(message, messages._ActorStop):  # noqa: SLF001
             return self._stop()
         if isinstance(message, messages.ProxyCall):
@@ -383,6 +491,11 @@ class Actor(abc.ABC):
             attr_name = message.attr_path[-1]
             return setattr(parent_attr, attr_name, message.value)
         return self.on_receive(message)
+
+    def _handle_supervised_restart(self) -> None:
+        """Gracefully end this incarnation so the supervisor restarts it."""
+        self._restarting = True
+        self.actor_stopped.set()
 
     def on_receive(self, message: Any) -> Any:
         """May be implemented for the actor to handle regular non-proxy messages.

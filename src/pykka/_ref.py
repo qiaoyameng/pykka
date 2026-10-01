@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -42,21 +43,72 @@ class ActorRef(Generic[A]):
     actor_urn: str
     """See [`Actor.actor_urn`][pykka.Actor.actor_urn]."""
 
+    _lock: threading.RLock
+    """Lock protecting the inbox/stopped-flag while a supervised actor restarts."""
+
     actor_inbox: ActorInbox
-    """See [`Actor.actor_inbox`][pykka.Actor.actor_inbox]."""
+    """The inbox of the actor's current incarnation.
+
+    For a supervised actor this follows the newest incarnation after a
+    restart; the [`ActorRef`][pykka.ActorRef] object itself stays the same.
+    """
 
     actor_stopped: Event
-    """See [`Actor.actor_stopped`][pykka.Actor.actor_stopped]."""
+    """A [`threading.Event`][threading.Event] representing the ref's liveness.
+
+    For a standalone actor this is the actor's own stopped flag. For a
+    supervised actor it is only set when the actor is permanently stopped,
+    not when an individual incarnation is restarted.
+    """
+
+    _stop_requested: bool
+    """Whether a graceful stop has been requested through this ref."""
+
+    _incarnation_ended: Event
+    """Set when the current incarnation's thread has fully finished."""
 
     def __init__(
         self,
         actor: A,
     ) -> None:
         self._actor_weakref = weakref.ref(actor)
+        self._lock = threading.RLock()
         self.actor_class = actor.__class__
         self.actor_urn = actor.actor_urn
         self.actor_inbox = actor.actor_inbox
         self.actor_stopped = actor.actor_stopped
+        self._stop_requested = False
+        self._incarnation_ended = actor._incarnation_ended
+
+    def _bind_supervised(self, actor: A) -> None:
+        """Make the ref represent a supervised actor's first incarnation."""
+        permanent_stopped = threading.Event()
+        with self._lock:
+            self._actor_weakref = weakref.ref(actor)
+            self.actor_class = actor.__class__
+            self.actor_urn = actor.actor_urn
+            self.actor_inbox = actor.actor_inbox
+            self.actor_stopped = permanent_stopped
+            self._incarnation_ended = actor._incarnation_ended
+
+    def _rebind(self, actor: A) -> tuple[ActorInbox, bool]:
+        """Point the ref at a new incarnation.
+
+        The URN and permanent stopped event are kept stable. Returns the
+        previous inbox and whether a graceful stop had already been requested.
+        """
+        with self._lock:
+            previous_inbox = self.actor_inbox
+            stop_requested = self._stop_requested
+            self._actor_weakref = weakref.ref(actor)
+            self.actor_class = actor.__class__
+            self.actor_inbox = actor.actor_inbox
+            return previous_inbox, stop_requested
+
+    def _mark_permanently_stopped(self) -> None:
+        """Mark the ref as permanently dead, independent of any incarnation."""
+        with self._lock:
+            self.actor_stopped.set()
 
     def __repr__(self) -> str:
         return f"<ActorRef for {self}>"
@@ -93,10 +145,11 @@ class ActorRef(Generic[A]):
             ActorDeadError: if actor is not available
 
         """
-        if not self.is_alive():
-            msg = f"{self} not found"
-            raise ActorDeadError(msg)
-        self.actor_inbox.put(Envelope(message))
+        with self._lock:
+            if not self.is_alive():
+                msg = f"{self} not found"
+                raise ActorDeadError(msg)
+            self.actor_inbox.put(Envelope(message))
 
     @overload
     def ask(
@@ -158,14 +211,15 @@ class ActorRef(Generic[A]):
         """
         future = self.actor_class._create_future()  # noqa: SLF001
 
-        try:
-            if not self.is_alive():
-                msg = f"{self} not found"
-                raise ActorDeadError(msg)  # noqa: TRY301
-        except ActorDeadError:
-            future.set_exception()
-        else:
-            self.actor_inbox.put(Envelope(message, reply_to=future))
+        with self._lock:
+            try:
+                if not self.is_alive():
+                    msg = f"{self} not found"
+                    raise ActorDeadError(msg)  # noqa: TRY301
+            except ActorDeadError:
+                future.set_exception()
+            else:
+                self.actor_inbox.put(Envelope(message, reply_to=future))
 
         if block:
             return future.get(timeout=timeout)
@@ -223,6 +277,9 @@ class ActorRef(Generic[A]):
             a future if not blocking, or a boolean result if blocking
 
         """
+        with self._lock:
+            if self.is_alive():
+                self._stop_requested = True
         ask_future = self.ask(_ActorStop(), block=False)
 
         def _stop_result_converter(timeout: float | None) -> bool:

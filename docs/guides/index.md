@@ -7,3 +7,5 @@ This section contains guides and tutorials for using Pykka.
 - [Deadlock debugging](deadlocks.md) - learn how to debug deadlocks in Pykka
   applications.
 - [Proxy typing](proxy-typing.md) - learn how to add type hints for actor proxies.
+- [Supervision](supervision.md) - learn how to build supervision trees with
+  restart strategies.

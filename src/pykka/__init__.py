@@ -11,6 +11,12 @@ from pykka._registry import ActorRegistry
 # The following must be imported late, in this specific order.
 from pykka._actor import Actor  # isort:skip
 from pykka._threading import ThreadingActor, ThreadingFuture  # isort:skip
+from pykka._supervision import (  # isort:skip
+    Child,
+    RestartStrategy,
+    Supervisor,
+    SupervisorStrategy,
+)
 
 
 __all__ = [
@@ -20,7 +26,11 @@ __all__ = [
     "ActorRef",
     "ActorRegistry",
     "CallableProxy",
+    "Child",
     "Future",
+    "RestartStrategy",
+    "Supervisor",
+    "SupervisorStrategy",
     "ThreadingActor",
     "ThreadingFuture",
     "Timeout",

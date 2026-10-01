@@ -36,6 +36,18 @@ class _ActorStop(NamedTuple):  # pyright: ignore[reportUnusedClass]
     """Internal message."""
 
 
+class _SupervisedRestart(NamedTuple):  # pyright: ignore[reportUnusedClass]
+    """Internal message requesting a healthy supervised child to restart."""
+
+
+class _ChildTerminated(NamedTuple):  # pyright: ignore[reportUnusedClass]
+    """Internal message notifying a supervisor that a child incarnation ended."""
+
+    name: str
+    failed: bool
+    generation: int
+
+
 class ProxyCall(NamedTuple):
     """Message to ask the actor to call the method with the arguments.
 

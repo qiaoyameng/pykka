@@ -21,9 +21,11 @@ nav:
       - guides/testing.md
       - guides/deadlocks.md
       - guides/proxy-typing.md
+      - guides/supervision.md
   - Reference:
       - reference/index.md
       - reference/actors.md
+      - reference/supervision.md
       - reference/proxies.md
       - reference/futures.md
       - reference/registry.md
