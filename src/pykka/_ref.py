@@ -27,6 +27,35 @@ __all__ = ["ActorRef"]
 A = TypeVar("A", bound="Actor")
 
 
+class _ActorBinding:
+    """Mutable identity cell backing an [`ActorRef`][pykka.ActorRef].
+
+    One binding can be shared by multiple incarnations of the same supervised
+    actor, so that a single stable reference follows the actor across restarts.
+    """
+
+    __slots__ = (
+        "actor",
+        "actor_class",
+        "actor_urn",
+        "actor_inbox",
+        "actor_stopped",
+    )
+
+    actor: weakref.ref[Actor]
+    actor_class: type[Actor]
+    actor_urn: str
+    actor_inbox: ActorInbox
+    actor_stopped: Event
+
+    def __init__(self, actor: Actor) -> None:
+        self.actor = weakref.ref(actor)
+        self.actor_class = actor.__class__
+        self.actor_urn = actor.actor_urn
+        self.actor_inbox = actor.actor_inbox
+        self.actor_stopped = actor.actor_stopped
+
+
 class ActorRef(Generic[A]):
     """Reference to a running actor which may safely be passed around.
 
@@ -36,27 +65,55 @@ class ActorRef(Generic[A]):
     [`ActorRef`][pykka.ActorRef] instances yourself.
     """
 
-    actor_class: type[A]
-    """The class of the referenced actor."""
-
-    actor_urn: str
-    """See [`Actor.actor_urn`][pykka.Actor.actor_urn]."""
-
-    actor_inbox: ActorInbox
-    """See [`Actor.actor_inbox`][pykka.Actor.actor_inbox]."""
-
-    actor_stopped: Event
-    """See [`Actor.actor_stopped`][pykka.Actor.actor_stopped]."""
-
     def __init__(
         self,
         actor: A,
     ) -> None:
-        self._actor_weakref = weakref.ref(actor)
-        self.actor_class = actor.__class__
-        self.actor_urn = actor.actor_urn
-        self.actor_inbox = actor.actor_inbox
-        self.actor_stopped = actor.actor_stopped
+        self._binding = _ActorBinding(actor)
+
+    @property
+    def actor_class(self) -> type[A]:
+        """The class of the referenced actor's current incarnation."""
+        return self._binding.actor_class  # type: ignore[return-value]
+
+    @property
+    def actor_urn(self) -> str:
+        """See [`Actor.actor_urn`][pykka.Actor.actor_urn].
+
+        The URN is stable across restarts of a supervised actor.
+        """
+        return self._binding.actor_urn
+
+    @property
+    def actor_inbox(self) -> ActorInbox:
+        """See [`Actor.actor_inbox`][pykka.Actor.actor_inbox]."""
+        return self._binding.actor_inbox
+
+    @property
+    def actor_stopped(self) -> Event:
+        """See [`Actor.actor_stopped`][pykka.Actor.actor_stopped]."""
+        return self._binding.actor_stopped
+
+    @property
+    def _actor_weakref(self) -> weakref.ref[A]:
+        return self._binding.actor  # type: ignore[return-value]
+
+    def _retarget(self, actor: Actor) -> None:
+        """Point the reference at a new incarnation of the same actor.
+
+        The stable [`actor_urn`][pykka.ActorRef.actor_urn] is preserved, while
+        inbox, stopped flag, class, and weak reference follow the new
+        incarnation.
+        """
+        binding = self._binding
+        binding.actor = weakref.ref(actor)
+        binding.actor_class = actor.__class__
+        binding.actor_inbox = actor.actor_inbox
+        binding.actor_stopped = actor.actor_stopped
+
+    def _set_urn(self, actor_urn: str) -> None:
+        """Pin the reference to a stable URN before the first start."""
+        self._binding.actor_urn = actor_urn
 
     def __repr__(self) -> str:
         return f"<ActorRef for {self}>"

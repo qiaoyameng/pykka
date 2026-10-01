@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from pykka import Future
     from pykka._envelope import Envelope
+    from pykka._types import OptExcInfo
 
 __all__ = ["Actor"]
 
@@ -31,6 +32,25 @@ class ActorInbox(Protocol):
     def get(self) -> Envelope[Any]: ...
 
     def empty(self) -> bool: ...
+
+
+class _StartBarrier:
+    """One-shot synchronization for a supervised actor's on_start() result."""
+
+    __slots__ = ("event", "exc_info", "done")
+
+    def __init__(self) -> None:
+        self.event: threading.Event = threading.Event()
+        self.exc_info: OptExcInfo | None = None
+        self.done: bool = False
+
+    def wait(self, timeout: float | None) -> bool:
+        return self.event.wait(timeout)
+
+    def signal(self, exc_info: OptExcInfo | None) -> None:
+        self.exc_info = exc_info
+        self.done = True
+        self.event.set()
 
 
 class Actor(abc.ABC):
@@ -116,14 +136,35 @@ class Actor(abc.ABC):
 
         """
         obj = cls(*args, **kwargs)
-        assert obj.actor_ref is not None, (
+        obj._before_loop_start()
+        return cls._start_incarnation(obj, obj.actor_ref, register=True)
+
+    @classmethod
+    def _start_incarnation(
+        cls: type[A],
+        obj: A,
+        stable_ref: ActorRef[A],
+        *,
+        register: bool,
+    ) -> ActorRef[A]:
+        """Register, start the loop, and return the ref for an incarnation.
+
+        The first incarnation is registered before its loop starts, preserving
+        the historical behavior of [`start()`][pykka.Actor.start]. Later
+        incarnations of a supervised actor are already registered under their
+        stable reference, so they are only retargeted.
+        """
+        assert stable_ref is not None, (
             "Actor.__init__() have not been called. "
             "Did you forget to call super() in your override?"
         )
-        ActorRegistry.register(obj.actor_ref)
+        if register:
+            ActorRegistry.register(stable_ref)
+        else:
+            stable_ref._retarget(obj)  # noqa: SLF001
         logger.debug(f"Starting {obj}")
         obj._start_actor_loop()
-        return obj.actor_ref
+        return stable_ref
 
     @staticmethod
     @abc.abstractmethod
@@ -216,6 +257,57 @@ class Actor(abc.ABC):
         self.actor_stopped = threading.Event()
 
         self._actor_ref = ActorRef(self)
+        self._supervisor_ref: ActorRef[Any] | None = None
+        self._incarnation = 0
+        self._start_barrier: _StartBarrier | None = None
+
+    def _bind_to_supervision(
+        self,
+        *,
+        supervisor_ref: ActorRef[Any],
+        stable_ref: ActorRef[Any],
+        stable_urn: str,
+        incarnation: int,
+    ) -> None:
+        """Attach this incarnation to its supervisor's stable reference.
+
+        Called on an actor instance, before its loop is started, by the
+        supervision machinery.
+        """
+        self._supervisor_ref = supervisor_ref
+        self._incarnation = incarnation
+        self.actor_urn = stable_urn
+        self._actor_ref = stable_ref
+        self._start_barrier = _StartBarrier()
+
+    def _before_loop_start(self) -> None:
+        """Hook run after construction, before the actor loop is started.
+
+        Ordinary actors have nothing to pin; a supervisor uses this to fix its
+        stable identity before any child can observe it.
+        """
+
+    def _wait_until_started(self, timeout: float | None) -> None:
+        """Block until a supervised incarnation reports on_start() outcome."""
+        barrier = self._start_barrier
+        assert barrier is not None
+
+        def _consume() -> None:
+            if barrier.exc_info is not None:
+                _exc_type, exc_value, exc_tb = barrier.exc_info
+                assert exc_value is not None
+                raise exc_value.with_traceback(exc_tb)
+
+        if not barrier.done:
+            if not barrier.wait(timeout):
+                msg = f"{self} did not start within {timeout} seconds"
+                raise TimeoutError(msg)
+        _consume()
+
+    def _signal_started(self, exc_info: OptExcInfo | None) -> None:
+        barrier = self._start_barrier
+        if barrier is not None:
+            barrier.signal(exc_info)
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__} ({self.actor_urn})"
@@ -230,13 +322,35 @@ class Actor(abc.ABC):
 
     def _stop(self) -> None:
         """Stop the actor immediately without processing the rest of the inbox."""
-        ActorRegistry.unregister(self.actor_ref)
+        if self._supervisor_ref is None:
+            ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
         logger.debug(f"Stopped {self}")
         try:
             self.on_stop()
         except Exception:  # noqa: BLE001
             self._handle_failure(*sys.exc_info())
+        if self._supervisor_ref is not None:
+            self._notify_terminated(failed=False)
+
+    def _notify_terminated(self, *, failed: bool) -> None:
+        """Inform the supervisor that this incarnation terminated.
+
+        Sent from the actor's own thread and processed in the supervisor's own
+        thread, so supervision state needs no locking. The incarnation counter
+        lets the supervisor ignore stale notifications after a restart.
+        """
+        from pykka._supervision import _ChildTerminated  # noqa: PLC0415
+
+        supervisor_ref = self._supervisor_ref
+        assert supervisor_ref is not None
+        supervisor_ref.tell(
+            _ChildTerminated(
+                urn=self.actor_urn,
+                incarnation=self._incarnation,
+                failed=failed,
+            )
+        )
 
     def _actor_loop(self) -> None:
         """Run the actor's core loop.
@@ -251,7 +365,13 @@ class Actor(abc.ABC):
         try:
             self.on_start()
         except Exception:  # noqa: BLE001
-            self._handle_failure(*sys.exc_info())
+            if not self.actor_stopped.is_set():
+                self._handle_failure(*sys.exc_info())
+            self._signal_started(sys.exc_info())
+            if self._supervisor_ref is not None:
+                self._notify_terminated(failed=True)
+        else:
+            self._signal_started(None)
 
     def _actor_loop_running(self) -> None:
         while not self.actor_stopped.is_set():
@@ -273,6 +393,8 @@ class Actor(abc.ABC):
                         self.on_failure(*sys.exc_info())
                     except Exception:  # noqa: BLE001
                         self._handle_failure(*sys.exc_info())
+                    if self._supervisor_ref is not None:
+                        self._notify_terminated(failed=True)
             except BaseException:  # noqa: BLE001
                 exception_value = sys.exc_info()[1]
                 logger.debug(f"{exception_value!r} in {self}. Stopping all actors.")
@@ -337,12 +459,17 @@ class Actor(abc.ABC):
         exception_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Log unexpected failures, unregisters and stops the actor."""
+        """Log unexpected failures and stop the actor.
+
+        A supervised actor leaves registry bookkeeping to its supervisor,
+        which owns the stable reference and decides whether to restart.
+        """
         logger.error(
             f"Unhandled exception in {self}:",
             exc_info=(exception_type, exception_value, traceback),  # type: ignore[arg-type]   # ty: ignore[invalid-argument-type]
         )
-        ActorRegistry.unregister(self.actor_ref)
+        if self._supervisor_ref is None:
+            ActorRegistry.unregister(self.actor_ref)
         self.actor_stopped.set()
 
     def on_failure(  # noqa: B027

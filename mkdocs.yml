@@ -24,6 +24,7 @@ nav:
   - Reference:
       - reference/index.md
       - reference/actors.md
+      - reference/supervision.md
       - reference/proxies.md
       - reference/futures.md
       - reference/registry.md

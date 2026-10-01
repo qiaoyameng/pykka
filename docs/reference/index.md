@@ -3,6 +3,7 @@
 This section contains reference documentation for Pykka's public API.
 
 - [Actors](actors.md) - the `Actor` base class and references to running actors.
+- [Supervision](supervision.md) - supervisors start, restart, and stop child actors.
 - [Proxies](proxies.md) - an `ActorProxy` is a convenient abstraction on top of an `Actor`.
 - [Futures](futures.md) - a `Future` is a handle to a result that may not be available yet.
 - [Registry](registry.md) - the `ActorRegistry` lets you get references to running actors.
